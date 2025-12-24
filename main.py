@@ -39,7 +39,7 @@ bot = EchoBot()
 async def on_error(context: TurnContext, error: Exception):
     # Shows up in logs; also tells the user something went wrong
     print(f"[on_turn_error] {error}")
-    await context.send_activity("Sorry — the bot hit an error.")
+    await context.send_activity("Sorry — the bot hit an error")
 
 
 @app.post("/api/messages")
