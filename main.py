@@ -35,11 +35,13 @@ adapter = BotFrameworkAdapter(adapter_settings)
 bot = EchoBot()
 
 
-@adapter.on_turn_error
 async def on_error(context: TurnContext, error: Exception):
     # Shows up in logs; also tells the user something went wrong
     print(f"[on_turn_error] {error}")
-    await context.send_activity("Sorry — the bot hit an error")
+    await context.send_activity("Sorry, the bot hit an error.")
+
+
+adapter.on_turn_error = on_error
 
 
 @app.post("/api/messages")
