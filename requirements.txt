@@ -3,3 +3,4 @@ uvicorn[standard]
 gunicorn
 botbuilder-core
 botbuilder-schema
+botframework-connector
