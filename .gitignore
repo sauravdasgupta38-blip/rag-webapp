@@ -1,0 +1,22 @@
+# ---- secrets / local env ----
+.env
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+
+# ---- virtual environments ----
+.venv/
+venv/
+env/
+
+# ---- IDEs ----
+.vscode/
+.idea/
+.DS_Store
