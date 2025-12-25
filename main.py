@@ -1,8 +1,10 @@
 import os
 import json
-import logging
+import time
 import base64
-from typing import Tuple, Optional, Any, Dict
+import logging
+import inspect
+from typing import Any, Dict, Optional, Tuple
 
 import aiohttp
 from fastapi import FastAPI, Request, Response
@@ -14,522 +16,387 @@ from botbuilder.core import (
     TurnContext,
 )
 from botbuilder.schema import Activity
-
 from botframework.connector.auth import MicrosoftAppCredentials
-from botbuilder.schema._models_py3 import ErrorResponseException  # for detailed exception handling
 
 
-# ======================
-# Optional: .env support
-# ======================
-try:
-    from dotenv import load_dotenv  # type: ignore
-    load_dotenv(override=False)
-except Exception:
-    pass
-
-
-# -----------------------
-# Logging
-# -----------------------
+# ---------------- Logging ----------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    level=logging.INFO,
+    level=LOG_LEVEL,
     format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
 )
 logger = logging.getLogger("surecover-bot")
 
 
-def _mask(s: str, keep_last: int = 4) -> str:
+# ---------------- Helpers ----------------
+def _env_first(*names: str, default: str = "") -> str:
+    """Return the first non-empty env var value from the provided names."""
+    for n in names:
+        v = os.getenv(n)
+        if v:
+            return v
+    return default
+
+
+def _mask(s: str, keep: int = 6) -> str:
     if not s:
         return ""
-    if len(s) <= keep_last:
+    if len(s) <= keep:
         return "*" * len(s)
-    return "*" * (len(s) - keep_last) + s[-keep_last:]
+    return "*" * (len(s) - keep) + s[-keep:]
 
 
-def _get_first_env(keys) -> str:
-    for k in keys:
-        v = os.getenv(k)
-        if v is not None and str(v).strip() != "":
-            return str(v).strip()
-    return ""
+def _b64url_decode(seg: str) -> bytes:
+    seg += "=" * ((4 - len(seg) % 4) % 4)
+    return base64.urlsafe_b64decode(seg.encode("utf-8"))
 
 
-def _decode_jwt_claims_no_verify(token: str) -> Dict[str, Any]:
+def decode_jwt_noverify(token: str) -> Dict[str, Any]:
     """
-    Decodes JWT payload without verifying signature (safe for diagnostics).
-    Returns {} on failure.
+    Decode JWT without verifying signature. Good for logging tid/aud/appid.
     """
     try:
         parts = token.split(".")
         if len(parts) < 2:
-            return {}
-        payload_b64 = parts[1]
-        # pad
-        payload_b64 += "=" * (-len(payload_b64) % 4)
-        payload = base64.urlsafe_b64decode(payload_b64.encode("utf-8")).decode("utf-8")
-        return json.loads(payload)
+            return {"_error": "not_a_jwt"}
+        payload = json.loads(_b64url_decode(parts[1]).decode("utf-8"))
+        return payload
+    except Exception as e:
+        return {"_error": f"decode_failed: {type(e).__name__}: {e}"}
+
+
+async def _read_response_text(resp: Any) -> Optional[str]:
+    """
+    Best-effort read of an async response body (aiohttp ClientResponse usually).
+    """
+    if resp is None:
+        return None
+    try:
+        # aiohttp: resp.text() is coroutine
+        if hasattr(resp, "text") and callable(resp.text):
+            v = resp.text()
+            if inspect.isawaitable(v):
+                return await v
+            return str(v)
+        # sometimes .content is available
+        if hasattr(resp, "content"):
+            return str(resp.content)
     except Exception:
-        return {}
+        return None
+    return None
 
 
-# -----------------------
-# Azure AI Language config
-# -----------------------
-LANGUAGE_ENDPOINT = os.getenv("LANGUAGE_ENDPOINT", "").rstrip("/")
-LANGUAGE_KEY = os.getenv("LANGUAGE_KEY", "")
-
-CLU_PROJECT_NAME = os.getenv("CLU_PROJECT_NAME", "surecover-clu")
-CLU_DEPLOYMENT_NAME = os.getenv("CLU_DEPLOYMENT_NAME", "surecover_dep")
-CLU_LANGUAGE = os.getenv("CLU_LANGUAGE", "en-gb")
-
-QA_PROJECT_NAME = os.getenv("QA_PROJECT_NAME", "surecover-qa")
-QA_DEPLOYMENT_NAME = os.getenv("QA_DEPLOYMENT_NAME", "production")
-
-CLU_API_VERSION = os.getenv("CLU_API_VERSION", "2024-11-15-preview")
-QA_API_VERSION = os.getenv("QA_API_VERSION", "2021-10-01")
-
-INTENT_MIN_CONFIDENCE = float(os.getenv("INTENT_MIN_CONFIDENCE", "0.55"))
-QA_MIN_CONFIDENCE = float(os.getenv("QA_MIN_CONFIDENCE", "0.45"))
-
-
-# -----------------------
-# Bot auth env (support multiple common names)
-# -----------------------
-MICROSOFT_APP_ID = _get_first_env(
-    ["MICROSOFT_APP_ID", "MicrosoftAppId", "MicrosoftAppID", "BOT_APP_ID"]
+# ---------------- Bot config from env ----------------
+APP_ID = _env_first("MICROSOFT_APP_ID", "MicrosoftAppId", default="")
+APP_PASSWORD = _env_first("MICROSOFT_APP_PASSWORD", "MicrosoftAppPassword", default="")
+APP_TENANT_ID = _env_first(
+    "MicrosoftAppTenantId",
+    "MICROSOFT_APP_TENANT_ID",
+    default="",
 )
-MICROSOFT_APP_PASSWORD = _get_first_env(
-    ["MICROSOFT_APP_PASSWORD", "MicrosoftAppPassword", "BOT_APP_PASSWORD"]
-)
-MICROSOFT_APP_TENANT_ID = _get_first_env(
-    ["MicrosoftAppTenantId", "MICROSOFT_APP_TENANT_ID", "BOT_TENANT_ID"]
-)
-MICROSOFT_APP_TYPE = _get_first_env(
-    ["MicrosoftAppType", "MICROSOFT_APP_TYPE", "BOT_APP_TYPE"]
-)
+APP_TYPE = _env_first("MicrosoftAppType", "MICROSOFT_APP_TYPE", default="").strip() or "MultiTenant"
+
+# Language Studio / Azure AI Language (optional – keep your existing env vars)
+LANGUAGE_ENDPOINT = _env_first("LANGUAGE_ENDPOINT", default="")
+LANGUAGE_KEY = _env_first("LANGUAGE_KEY", default="")
+CLU_PROJECT_NAME = _env_first("CLU_PROJECT_NAME", default="")
+CLU_DEPLOYMENT_NAME = _env_first("CLU_DEPLOYMENT_NAME", default="")
+QA_PROJECT_NAME = _env_first("QA_PROJECT_NAME", default="")
+QA_DEPLOYMENT_NAME = _env_first("QA_DEPLOYMENT_NAME", default="")
 
 logger.info(
-    "BOT_AUTH startup: app_id=%s tenant_id=%s app_type=%s password_present=%s password_len=%s",
-    MICROSOFT_APP_ID or "<EMPTY>",
-    MICROSOFT_APP_TENANT_ID or "<EMPTY>",
-    MICROSOFT_APP_TYPE or "<EMPTY>",
-    "YES" if MICROSOFT_APP_PASSWORD else "NO",
-    len(MICROSOFT_APP_PASSWORD) if MICROSOFT_APP_PASSWORD else 0,
+    "BOOT_AUTH appType=%s appIdTail=%s tenantIdTail=%s appSecretLen=%s "
+    "envUsed(appId=%s appPwd=%s tenant=%s type=%s)",
+    APP_TYPE,
+    _mask(APP_ID, keep=6),
+    _mask(APP_TENANT_ID, keep=6),
+    len(APP_PASSWORD) if APP_PASSWORD else 0,
+    "MICROSOFT_APP_ID/MicrosoftAppId",
+    "MICROSOFT_APP_PASSWORD/MicrosoftAppPassword",
+    "MicrosoftAppTenantId/MICROSOFT_APP_TENANT_ID",
+    "MicrosoftAppType/MICROSOFT_APP_TYPE",
 )
 
-if not MICROSOFT_APP_ID:
-    logger.warning("BOT_AUTH: MICROSOFT_APP_ID/MicrosoftAppId is empty. Outbound calls will fail.")
-if not MICROSOFT_APP_PASSWORD:
-    logger.warning("BOT_AUTH: MICROSOFT_APP_PASSWORD/MicrosoftAppPassword is empty. Outbound calls will fail.")
+if not APP_ID or not APP_PASSWORD:
+    logger.warning(
+        "BOOT_AUTH_MISSING appIdPresent=%s appPwdPresent=%s (this will cause auth failures)",
+        bool(APP_ID),
+        bool(APP_PASSWORD),
+    )
+
+# ---------------- Adapter setup ----------------
+adapter_settings = BotFrameworkAdapterSettings(APP_ID, APP_PASSWORD)
+
+# Force SingleTenant tenant binding when supported by the installed SDK
+if APP_TYPE.lower() == "singletentant" or APP_TYPE.lower() == "singletenant":
+    if APP_TENANT_ID:
+        if hasattr(adapter_settings, "channel_auth_tenant"):
+            adapter_settings.channel_auth_tenant = APP_TENANT_ID
+            logger.info("BOOT_AUTH adapter_settings.channel_auth_tenant set to tenantIdTail=%s", _mask(APP_TENANT_ID, 6))
+        elif hasattr(adapter_settings, "tenant_id"):
+            adapter_settings.tenant_id = APP_TENANT_ID
+            logger.info("BOOT_AUTH adapter_settings.tenant_id set to tenantIdTail=%s", _mask(APP_TENANT_ID, 6))
+        else:
+            logger.warning(
+                "BOOT_AUTH could not set tenant on adapter_settings (SDK too old?). "
+                "SingleTenant bots may fail unless the SDK supports channel_auth_tenant."
+            )
+    else:
+        logger.warning("BOOT_AUTH SingleTenant selected but no tenant id found in env vars.")
+
+adapter = BotFrameworkAdapter(adapter_settings)
 
 
-# -----------------------
-# REST calls (CLU + QA)
-# -----------------------
-async def call_clu(text: str) -> dict:
-    if not LANGUAGE_ENDPOINT or not LANGUAGE_KEY:
-        raise RuntimeError("Missing LANGUAGE_ENDPOINT or LANGUAGE_KEY.")
+def _log_bot_token_claims(tag: str, service_url: Optional[str] = None) -> None:
+    """
+    Try to acquire the same token the SDK uses and log key claims.
+    If this fails or claims are wrong, it explains the Unauthorized.
+    """
+    try:
+        creds = MicrosoftAppCredentials(APP_ID, APP_PASSWORD)
+        if service_url:
+            # Not required for outbound, but harmless and useful
+            MicrosoftAppCredentials.trust_service_url(service_url)
 
-    url = f"{LANGUAGE_ENDPOINT}/language/:analyze-conversations?api-version={CLU_API_VERSION}"
+        tok = creds.get_access_token()
+        claims = decode_jwt_noverify(tok)
+        logger.error(
+            "BF_TOKEN %s tokenPrefix=%s tid=%s aud=%s appid=%s azp=%s iss=%s exp=%s",
+            tag,
+            tok[:20] + "...",
+            claims.get("tid"),
+            claims.get("aud"),
+            claims.get("appid") or claims.get("azp") or claims.get("appId"),
+            claims.get("azp"),
+            claims.get("iss"),
+            claims.get("exp"),
+        )
+    except Exception as e:
+        logger.error("BF_TOKEN %s failed_to_get_token: %s: %s", tag, type(e).__name__, e)
+
+
+async def safe_send_text(turn_context: TurnContext, text: str) -> None:
+    """
+    Send a message with deep diagnostics on Unauthorized.
+    """
+    svc = getattr(turn_context.activity, "service_url", None)
+    ch = getattr(turn_context.activity, "channel_id", None)
+    conv = getattr(getattr(turn_context.activity, "conversation", None), "id", None)
+    try:
+        # Trust service URL for completeness
+        if svc:
+            MicrosoftAppCredentials.trust_service_url(svc)
+
+        await turn_context.send_activity(text)
+    except Exception as e:
+        # Log token claims right when it fails
+        _log_bot_token_claims("on_send_fail", service_url=svc)
+
+        # Try to extract HTTP response info if present
+        resp = getattr(e, "response", None)
+        status = getattr(resp, "status", None) or getattr(resp, "status_code", None)
+        reason = getattr(resp, "reason", None)
+        headers = getattr(resp, "headers", None) or {}
+        www_auth = None
+        try:
+            if headers:
+                www_auth = headers.get("WWW-Authenticate") or headers.get("www-authenticate")
+        except Exception:
+            pass
+
+        body = await _read_response_text(resp)
+
+        logger.error(
+            "SEND_FAIL %s: status=%s reason=%s www_auth=%s channel=%s serviceUrl=%s convId=%s body=%s",
+            type(e).__name__,
+            status,
+            reason,
+            www_auth,
+            ch,
+            svc,
+            conv,
+            (body[:800] + "...") if body and len(body) > 800 else body,
+        )
+        raise
+
+
+# ---------------- Azure AI Language calls (simple example) ----------------
+async def call_clu(text: str) -> Tuple[str, float, Dict[str, Any]]:
+    """
+    Returns (intent, score, raw_json). If not configured, returns fallback.
+    """
+    if not (LANGUAGE_ENDPOINT and LANGUAGE_KEY and CLU_PROJECT_NAME and CLU_DEPLOYMENT_NAME):
+        return ("SmallTalk", 0.0, {"_note": "CLU not configured; fallback intent"})
+    url = f"{LANGUAGE_ENDPOINT}/language/:analyze-conversations?api-version=2022-10-01-preview"
     payload = {
         "kind": "Conversation",
         "analysisInput": {
             "conversationItem": {
                 "id": "1",
-                "text": text,
-                "modality": "text",
-                "language": CLU_LANGUAGE,
                 "participantId": "user",
+                "text": text,
             }
         },
         "parameters": {
             "projectName": CLU_PROJECT_NAME,
             "deploymentName": CLU_DEPLOYMENT_NAME,
-            "verbose": True,
-            "stringIndexType": "TextElement_V8",
+            "stringIndexType": "Utf16CodeUnit",
         },
     }
-    headers = {
-        "Ocp-Apim-Subscription-Key": LANGUAGE_KEY,
-        "Content-Type": "application/json",
-    }
-
+    headers = {"Ocp-Apim-Subscription-Key": LANGUAGE_KEY, "Content-Type": "application/json"}
     async with aiohttp.ClientSession() as session:
-        async with session.post(url, json=payload, headers=headers, timeout=20) as resp:
-            data = await resp.json(content_type=None)
-            if resp.status >= 400:
-                raise RuntimeError(f"CLU HTTP {resp.status}: {data}")
-            return data
+        async with session.post(url, headers=headers, json=payload) as r:
+            j = await r.json()
+    top = j.get("result", {}).get("prediction", {}).get("topIntent", "")
+    intents = j.get("result", {}).get("prediction", {}).get("intents", [])
+    score = 0.0
+    for it in intents:
+        if it.get("category") == top:
+            score = float(it.get("confidenceScore", 0.0))
+            break
+    return (top or "None", score, j)
 
 
-def _confidence_from_intents(top_intent: str, intents_obj: Any) -> float:
-    if isinstance(intents_obj, dict):
-        return float((intents_obj.get(top_intent) or {}).get("confidenceScore") or 0.0)
-
-    if isinstance(intents_obj, list):
-        for item in intents_obj:
-            if not isinstance(item, dict):
-                continue
-            name = item.get("category") or item.get("intent") or item.get("name")
-            if name == top_intent:
-                return float(item.get("confidenceScore") or item.get("confidence") or 0.0)
-
-    return 0.0
-
-
-def _entities_to_string(entities_obj: Any) -> str:
-    out = []
-    if not isinstance(entities_obj, list):
-        return ""
-
-    for e in entities_obj:
-        if not isinstance(e, dict):
-            continue
-
-        cat = e.get("category") or e.get("entity") or e.get("name")
-        txt = e.get("text")
-
-        if not txt:
-            resolutions = e.get("resolutions")
-            if isinstance(resolutions, list) and resolutions and isinstance(resolutions[0], dict):
-                txt = resolutions[0].get("value")
-
-        if cat and txt:
-            out.append(f"{cat}={txt}")
-
-    return ", ".join(out)
-
-
-def parse_clu(clu_json: dict) -> Tuple[str, float, str]:
-    prediction = (clu_json.get("result") or {}).get("prediction") or {}
-    top_intent = prediction.get("topIntent") or prediction.get("top_intent") or "None"
-
-    intents_obj = prediction.get("intents") or {}
-    score = _confidence_from_intents(top_intent, intents_obj)
-
-    entities_obj = prediction.get("entities") or []
-    entities_str = _entities_to_string(entities_obj)
-
-    return top_intent, score, entities_str
-
-
-async def call_qa(question: str) -> dict:
-    if not LANGUAGE_ENDPOINT or not LANGUAGE_KEY:
-        raise RuntimeError("Missing LANGUAGE_ENDPOINT or LANGUAGE_KEY.")
-
-    url = (
-        f"{LANGUAGE_ENDPOINT}/language/:query-knowledgebases"
-        f"?projectName={QA_PROJECT_NAME}"
-        f"&deploymentName={QA_DEPLOYMENT_NAME}"
-        f"&api-version={QA_API_VERSION}"
-    )
-    payload = {"question": question, "top": 3}
-    headers = {
-        "Ocp-Apim-Subscription-Key": LANGUAGE_KEY,
-        "Content-Type": "application/json",
+async def call_qa(text: str) -> Tuple[str, float, Dict[str, Any]]:
+    """
+    Returns (answer, score, raw_json). If not configured, returns fallback.
+    """
+    if not (LANGUAGE_ENDPOINT and LANGUAGE_KEY and QA_PROJECT_NAME and QA_DEPLOYMENT_NAME):
+        return ("(QA not configured)", 0.0, {"_note": "QA not configured"})
+    url = f"{LANGUAGE_ENDPOINT}/language/:query-knowledgebases?api-version=2021-10-01"
+    payload = {
+        "question": text,
+        "projectName": QA_PROJECT_NAME,
+        "deploymentName": QA_DEPLOYMENT_NAME,
+        "top": 1,
     }
-
+    headers = {"Ocp-Apim-Subscription-Key": LANGUAGE_KEY, "Content-Type": "application/json"}
     async with aiohttp.ClientSession() as session:
-        async with session.post(url, json=payload, headers=headers, timeout=20) as resp:
-            data = await resp.json(content_type=None)
-            if resp.status >= 400:
-                raise RuntimeError(f"QA HTTP {resp.status}: {data}")
-            return data
+        async with session.post(url, headers=headers, json=payload) as r:
+            j = await r.json()
+    answers = j.get("answers", [])
+    if not answers:
+        return ("(no answer)", 0.0, j)
+    best = answers[0]
+    return (best.get("answer", "(empty)"), float(best.get("confidenceScore", 0.0)), j)
 
 
-def parse_qa(qa_json: dict) -> Tuple[Optional[str], float]:
-    answers = qa_json.get("answers") or []
-    if not answers or not isinstance(answers, list):
-        return None, 0.0
-
-    best = answers[0] if isinstance(answers[0], dict) else {}
-    answer = best.get("answer")
-    score = float(best.get("confidenceScore") or 0.0)
-    return answer, score
-
-
-# -----------------------
-# Tool stubs
-# -----------------------
-async def tool_stub_reply(intent: str, entities_str: str) -> str:
-    if intent == "ClaimStatus":
-        return (
-            f"I can help check claim status. Detected: {entities_str or 'no claim id yet'}.\n"
-            f"What is your claim ID (e.g., CLM-10492)?"
-        )
-    if intent == "GetQuote":
-        return (
-            f"I can start a quote. Detected: {entities_str or 'missing details'}.\n"
-            f"What’s the vehicle year/make/model and postal code?"
-        )
-    if intent == "UpdateContact":
-        return (
-            f"I can update contact details. Detected: {entities_str or 'missing details'}.\n"
-            f"What would you like to update (phone/email/address)?"
-        )
-    if intent == "FileClaim":
-        return "I can guide you through filing a claim. Is this auto or home, and when did it happen?"
-    if intent == "Handoff":
-        return "Sure — I can connect you to an agent. Before I do, what’s your policy number?"
-    if intent == "Help":
-        return "I can answer FAQs, check claim status, help file a claim, start a quote, or update contact details."
-    return "Got it. How can I help?"
-
-
-async def safe_send_text(turn_context: TurnContext, text: str) -> None:
-    """
-    Wraps send_activity with extra logging so Unauthorized errors show context.
-    """
-    activity = turn_context.activity
-    try:
-        await turn_context.send_activity(text)
-    except ErrorResponseException as e:
-        logger.error(
-            "SEND_FAIL ErrorResponseException: status=%s msg=%s channel=%s serviceUrl=%s convId=%s recipient=%s from=%s",
-            getattr(getattr(e, "response", None), "status", None),
-            str(e),
-            getattr(activity, "channel_id", None),
-            getattr(activity, "service_url", None),
-            getattr(getattr(activity, "conversation", None), "id", None),
-            getattr(getattr(activity, "recipient", None), "id", None),
-            getattr(getattr(activity, "from_property", None), "id", None),
-        )
-        raise
-    except Exception as e:
-        logger.exception(
-            "SEND_FAIL Exception: %s channel=%s serviceUrl=%s convId=%s",
-            e,
-            getattr(activity, "channel_id", None),
-            getattr(activity, "service_url", None),
-            getattr(getattr(activity, "conversation", None), "id", None),
-        )
-        raise
-
-
-# -----------------------
-# Bot logic
-# -----------------------
-class SureCoverBot(ActivityHandler):
+# ---------------- Bot logic ----------------
+class SurecoverBot(ActivityHandler):
     async def on_message_activity(self, turn_context: TurnContext):
-        activity = turn_context.activity
-        user_text = (activity.text or "").strip()
-
-        # Log inbound activity details (critical for diagnosing 401 send)
-        logger.info(
-            "ACTIVITY_IN type=%s channel=%s serviceUrl=%s convId=%s from=%s recipient=%s authHint=%s",
-            getattr(activity, "type", None),
-            getattr(activity, "channel_id", None),
-            getattr(activity, "service_url", None),
-            getattr(getattr(activity, "conversation", None), "id", None),
-            getattr(getattr(activity, "from_property", None), "id", None),
-            getattr(getattr(activity, "recipient", None), "id", None),
-            # sometimes channel includes extra hints in channel_data
-            "hasChannelData" if getattr(activity, "channel_data", None) else "noChannelData",
-        )
-
-        # Trust the serviceUrl before any outbound send.
-        # If serviceUrl isn't trusted, SDK may not attach auth header -> 401 Unauthorized.
-        try:
-            if activity.service_url:
-                MicrosoftAppCredentials.trust_service_url(activity.service_url)
-                logger.info("BOT_AUTH trusted serviceUrl=%s", activity.service_url)
-        except Exception as ex:
-            logger.exception("BOT_AUTH failed to trust serviceUrl: %s", ex)
-
+        user_text = (turn_context.activity.text or "").strip()
         if not user_text:
-            await safe_send_text(turn_context, "I didn’t catch that—try typing a question.")
+            await safe_send_text(turn_context, "I didn't receive any text.")
             return
 
-        # 1) CLU
-        try:
-            clu_json = await call_clu(user_text)
-            intent, intent_score, entities_str = parse_clu(clu_json)
-            logger.info("CLU intent=%s score=%.3f entities=%s", intent, intent_score, entities_str)
-        except Exception as ex:
-            logger.exception("CLU failed: %s", ex)
-            await safe_send_text(turn_context, "Sorry — I couldn’t analyze that message right now.")
+        intent, score, _ = await call_clu(user_text)
+        logger.info("CLU intent=%s score=%.3f", intent, score)
+
+        # Example routing
+        if intent.lower() == "smalltalk":
+            await safe_send_text(turn_context, "Hi! (SmallTalk) — try asking me a question.")
             return
 
-        # 2) Low-confidence
-        if intent_score < INTENT_MIN_CONFIDENCE:
-            await safe_send_text(
-                turn_context,
-                "I’m not fully sure what you need. Are you asking an FAQ, checking a claim, requesting a quote, or updating contact details?",
-            )
-            return
-
-        # 3) FAQ + SmallTalk -> QA
-        if intent in ("FAQ", "SmallTalk"):
-            try:
-                qa_json = await call_qa(user_text)
-                answer, qa_score = parse_qa(qa_json)
-                logger.info("QA intent=%s score=%.3f", intent, qa_score)
-            except Exception as ex:
-                logger.exception("QA failed: %s", ex)
-                await safe_send_text(turn_context, "Sorry — I couldn’t reach the FAQ service right now.")
-                return
-
-            if answer and qa_score >= QA_MIN_CONFIDENCE:
-                await safe_send_text(turn_context, answer)
-                return
-
-            if intent == "SmallTalk":
-                await safe_send_text(turn_context, "Hi! How can I help with your insurance today?")
-                return
-
-            await safe_send_text(
-                turn_context,
-                "I couldn’t find a confident FAQ answer. Would you like me to search policy documents next (RAG) or connect you to an agent?",
-            )
-            return
-
-        # 4) Other intents -> stub
-        try:
-            reply = await tool_stub_reply(intent, entities_str)
-            await safe_send_text(turn_context, reply)
-        except Exception as ex:
-            logger.exception("Tool routing failed: %s", ex)
-            await safe_send_text(turn_context, "Sorry — something went wrong while handling that request.")
+        ans, qa_score, _ = await call_qa(user_text)
+        logger.info("QA score=%.3f", qa_score)
+        await safe_send_text(turn_context, ans)
 
 
-# -----------------------
-# FastAPI app
-# -----------------------
-app = FastAPI()
+bot = SurecoverBot()
 
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-
-@app.get("/debug/env")
-def debug_env():
-    """
-    Confirms what the app sees (never returns secret values).
-    """
-    return {
-        "LANGUAGE_ENDPOINT_set": bool(LANGUAGE_ENDPOINT),
-        "LANGUAGE_KEY_set": bool(LANGUAGE_KEY),
-        "CLU_PROJECT_NAME": CLU_PROJECT_NAME,
-        "CLU_DEPLOYMENT_NAME": CLU_DEPLOYMENT_NAME,
-        "CLU_LANGUAGE": CLU_LANGUAGE,
-        "QA_PROJECT_NAME": QA_PROJECT_NAME,
-        "QA_DEPLOYMENT_NAME": QA_DEPLOYMENT_NAME,
-        "BOT_AUTH": {
-            "app_id": MICROSOFT_APP_ID or "",
-            "tenant_id": MICROSOFT_APP_TENANT_ID or "",
-            "app_type": MICROSOFT_APP_TYPE or "",
-            "password_present": bool(MICROSOFT_APP_PASSWORD),
-            "password_masked": _mask(MICROSOFT_APP_PASSWORD) if MICROSOFT_APP_PASSWORD else "",
-            "password_len": len(MICROSOFT_APP_PASSWORD) if MICROSOFT_APP_PASSWORD else 0,
-        },
-    }
-
-
-@app.get("/debug/bot-token")
-def debug_bot_token():
-    """
-    Attempts to acquire a Bot Framework token using the configured app id/secret.
-    Returns token claims (no token string).
-    """
-    if not MICROSOFT_APP_ID or not MICROSOFT_APP_PASSWORD:
-        return {
-            "ok": False,
-            "error": "Missing MICROSOFT_APP_ID/MICROSOFT_APP_PASSWORD (or MicrosoftAppId/MicrosoftAppPassword).",
-        }
-
-    creds = MicrosoftAppCredentials(MICROSOFT_APP_ID, MICROSOFT_APP_PASSWORD)
-    try:
-        token = creds.get_access_token()
-        claims = _decode_jwt_claims_no_verify(token)
-        # only return minimal claims
-        return {
-            "ok": True,
-            "claims_subset": {
-                "aud": claims.get("aud"),
-                "iss": claims.get("iss"),
-                "tid": claims.get("tid") or claims.get("tenant_id"),
-                "appid": claims.get("appid") or claims.get("azp"),
-                "exp": claims.get("exp"),
-            },
-        }
-    except Exception as ex:
-        logger.exception("BOT_AUTH token acquisition failed: %s", ex)
-        return {"ok": False, "error": str(ex)}
-
-
-# -----------------------
-# Debug endpoints (existing)
-# -----------------------
-@app.get("/debug/clu")
-async def debug_clu(q: str):
-    clu_json = await call_clu(q)
-    intent, score, entities = parse_clu(clu_json)
-    return {
-        "intent": intent,
-        "score": score,
-        "entities": entities,
-        "language_sent": CLU_LANGUAGE,
-        "project": CLU_PROJECT_NAME,
-        "deployment": CLU_DEPLOYMENT_NAME,
-    }
-
-
-@app.get("/debug/qa")
-async def debug_qa(q: str):
-    qa_json = await call_qa(q)
-    answer, score = parse_qa(qa_json)
-    return {
-        "answer": answer,
-        "score": score,
-        "project": QA_PROJECT_NAME,
-        "deployment": QA_DEPLOYMENT_NAME,
-    }
-
-
-# -----------------------
-# Bot Framework adapter
-# -----------------------
-adapter_settings = BotFrameworkAdapterSettings(MICROSOFT_APP_ID, MICROSOFT_APP_PASSWORD)
-adapter = BotFrameworkAdapter(adapter_settings)
-bot = SureCoverBot()
-
-
+# ---------------- Error handler ----------------
 async def on_error(context: TurnContext, error: Exception):
-    # Log the root error with max detail
     logger.exception("[on_turn_error] %s", error)
-
-    # IMPORTANT: sending may also fail (and can recurse). So guard it.
+    # Try to send a user-friendly error, but don’t create a second exception storm
     try:
         await safe_send_text(context, "Sorry, the bot hit an error.")
-    except Exception as send_ex:
-        logger.error("on_error: failed to send error message (likely auth issue): %s", send_ex)
+    except Exception as e:
+        logger.error("on_error: failed to send error message (likely auth issue): %s", e)
 
 
 adapter.on_turn_error = on_error
 
 
+# ---------------- FastAPI app ----------------
+app = FastAPI()
+
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "time": int(time.time()),
+        "appType": APP_TYPE,
+        "appIdTail": _mask(APP_ID, 6),
+        "tenantIdTail": _mask(APP_TENANT_ID, 6),
+    }
+
+
+@app.get("/debug/token")
+async def debug_token():
+    """
+    Returns token claims (no signature verification) for the token the SDK acquires.
+    Do NOT expose this publicly in production.
+    """
+    try:
+        creds = MicrosoftAppCredentials(APP_ID, APP_PASSWORD)
+        tok = creds.get_access_token()
+        claims = decode_jwt_noverify(tok)
+        # return only safe-ish subset
+        return {
+            "tokenPrefix": tok[:20] + "...",
+            "tid": claims.get("tid"),
+            "aud": claims.get("aud"),
+            "appid": claims.get("appid") or claims.get("azp"),
+            "iss": claims.get("iss"),
+            "exp": claims.get("exp"),
+        }
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
 @app.post("/api/messages")
 async def messages(req: Request):
-    # Helpful inbound request logging
-    auth_header = req.headers.get("Authorization", "")
-    logger.info(
-        "HTTP_IN /api/messages authHeaderPresent=%s authHeaderPrefix=%s",
-        bool(auth_header),
-        auth_header[:20] + "..." if auth_header else "",
-    )
-
     body = await req.json()
     activity = Activity().deserialize(body)
+    auth_header = req.headers.get("Authorization", "")
+
+    # Incoming HTTP diagnostics (don’t log full bearer token)
+    auth_present = bool(auth_header)
+    auth_prefix = auth_header[:30] + "..." if auth_present else ""
+    logger.info("HTTP_IN /api/messages authHeaderPresent=%s authHeaderPrefix=%s", auth_present, auth_prefix)
+
+    # Activity diagnostics
+    try:
+        conv_id = getattr(getattr(activity, "conversation", None), "id", None)
+        from_id = getattr(getattr(activity, "from_property", None), "id", None)
+        recip_id = getattr(getattr(activity, "recipient", None), "id", None)
+        service_url = getattr(activity, "service_url", None)
+        channel_id = getattr(activity, "channel_id", None)
+        logger.info(
+            "ACTIVITY_IN type=%s channel=%s serviceUrl=%s convId=%s from=%s recipient=%s authHint=%s",
+            getattr(activity, "type", None),
+            channel_id,
+            service_url,
+            conv_id,
+            from_id,
+            recip_id,
+            "hasChannelData" if getattr(activity, "channel_data", None) else "noChannelData",
+        )
+        if service_url:
+            logger.info("BOT_AUTH trusted serviceUrl=%s", service_url)
+            MicrosoftAppCredentials.trust_service_url(service_url)
+    except Exception:
+        logger.exception("ACTIVITY_IN logging failed")
 
     invoke_response = await adapter.process_activity(activity, auth_header, bot.on_turn)
 
     if invoke_response:
-        content = invoke_response.body
-        if isinstance(content, (dict, list)):
-            content = json.dumps(content)
-        return Response(content=content, status_code=invoke_response.status, media_type="application/json")
+        return Response(
+            content=invoke_response.body,
+            status_code=invoke_response.status,
+            media_type="application/json",
+        )
 
     return Response(status_code=201)
