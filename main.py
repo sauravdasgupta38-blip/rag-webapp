@@ -1,12 +1,10 @@
 import os
 import json
-import time
 import base64
+import asyncio
 import logging
-import inspect
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
-import aiohttp
 from fastapi import FastAPI, Request, Response
 
 from botbuilder.core import (
@@ -16,387 +14,251 @@ from botbuilder.core import (
     TurnContext,
 )
 from botbuilder.schema import Activity
-from botframework.connector.auth import MicrosoftAppCredentials
-
+from botbuilder.schema._models_py3 import ErrorResponseException
 
 # ---------------- Logging ----------------
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(
-    level=LOG_LEVEL,
-    format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
-)
+LOG_LEVEL = (os.getenv("LOG_LEVEL") or "INFO").upper()
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 logger = logging.getLogger("surecover-bot")
+
+app = FastAPI()
 
 
 # ---------------- Helpers ----------------
-def _env_first(*names: str, default: str = "") -> str:
-    """Return the first non-empty env var value from the provided names."""
+def _env_first(*names: str) -> Optional[str]:
     for n in names:
         v = os.getenv(n)
-        if v:
+        if v is not None and str(v).strip() != "":
             return v
-    return default
-
-
-def _mask(s: str, keep: int = 6) -> str:
-    if not s:
-        return ""
-    if len(s) <= keep:
-        return "*" * len(s)
-    return "*" * (len(s) - keep) + s[-keep:]
-
-
-def _b64url_decode(seg: str) -> bytes:
-    seg += "=" * ((4 - len(seg) % 4) % 4)
-    return base64.urlsafe_b64decode(seg.encode("utf-8"))
-
-
-def decode_jwt_noverify(token: str) -> Dict[str, Any]:
-    """
-    Decode JWT without verifying signature. Good for logging tid/aud/appid.
-    """
-    try:
-        parts = token.split(".")
-        if len(parts) < 2:
-            return {"_error": "not_a_jwt"}
-        payload = json.loads(_b64url_decode(parts[1]).decode("utf-8"))
-        return payload
-    except Exception as e:
-        return {"_error": f"decode_failed: {type(e).__name__}: {e}"}
-
-
-async def _read_response_text(resp: Any) -> Optional[str]:
-    """
-    Best-effort read of an async response body (aiohttp ClientResponse usually).
-    """
-    if resp is None:
-        return None
-    try:
-        # aiohttp: resp.text() is coroutine
-        if hasattr(resp, "text") and callable(resp.text):
-            v = resp.text()
-            if inspect.isawaitable(v):
-                return await v
-            return str(v)
-        # sometimes .content is available
-        if hasattr(resp, "content"):
-            return str(resp.content)
-    except Exception:
-        return None
     return None
 
 
-# ---------------- Bot config from env ----------------
-APP_ID = _env_first("MICROSOFT_APP_ID", "MicrosoftAppId", default="")
-APP_PASSWORD = _env_first("MICROSOFT_APP_PASSWORD", "MicrosoftAppPassword", default="")
-APP_TENANT_ID = _env_first(
-    "MicrosoftAppTenantId",
-    "MICROSOFT_APP_TENANT_ID",
-    default="",
-)
-APP_TYPE = _env_first("MicrosoftAppType", "MICROSOFT_APP_TYPE", default="").strip() or "MultiTenant"
+def _mask(s: Optional[str], keep: int = 6) -> str:
+    if not s:
+        return "(empty)"
+    s = str(s)
+    if len(s) <= keep:
+        return "*" * len(s)
+    return s[:keep] + "…" + s[-2:]
 
-# Language Studio / Azure AI Language (optional – keep your existing env vars)
-LANGUAGE_ENDPOINT = _env_first("LANGUAGE_ENDPOINT", default="")
-LANGUAGE_KEY = _env_first("LANGUAGE_KEY", default="")
-CLU_PROJECT_NAME = _env_first("CLU_PROJECT_NAME", default="")
-CLU_DEPLOYMENT_NAME = _env_first("CLU_DEPLOYMENT_NAME", default="")
-QA_PROJECT_NAME = _env_first("QA_PROJECT_NAME", default="")
-QA_DEPLOYMENT_NAME = _env_first("QA_DEPLOYMENT_NAME", default="")
+
+def _decode_jwt_noverify(token: str) -> Dict[str, Any]:
+    """Decode JWT payload without verifying signature (debug only)."""
+    try:
+        parts = token.split(".")
+        if len(parts) < 2:
+            return {}
+        payload = parts[1]
+        payload += "=" * (-len(payload) % 4)
+        data = base64.urlsafe_b64decode(payload.encode("utf-8"))
+        return json.loads(data.decode("utf-8"))
+    except Exception:
+        return {}
+
+
+def _safe_claims(claims: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a compact claim subset (avoid dumping long/PII-heavy stuff)."""
+    keep_keys = ["iss", "aud", "appid", "azp", "tid", "ver", "scp", "roles", "idtyp"]
+    out: Dict[str, Any] = {}
+    for k in keep_keys:
+        if k in claims:
+            out[k] = claims[k]
+    return out
+
+
+async def _log_adapter_token_claims(adapter_obj: Any) -> None:
+    """
+    Best-effort: attempt to access the adapter's credentials and log the outbound
+    connector token claims used to call the channel service (WebChat/DirectLine).
+    """
+    try:
+        cred = None
+        for attr in ["_credentials", "credentials", "_app_credentials"]:
+            if hasattr(adapter_obj, attr):
+                cred = getattr(adapter_obj, attr)
+                if cred is not None:
+                    break
+
+        if cred is None or not hasattr(cred, "get_access_token"):
+            logger.info("ADAPTER_TOKEN: cannot access adapter credentials/get_access_token()")
+            return
+
+        tok = cred.get_access_token()  # sometimes returns coroutine
+        if asyncio.iscoroutine(tok):
+            tok = await tok
+        claims = _decode_jwt_noverify(str(tok))
+        logger.info("ADAPTER_TOKEN_CLAIMS %s", json.dumps(_safe_claims(claims), ensure_ascii=False))
+    except Exception as e:
+        logger.warning("ADAPTER_TOKEN_CLAIMS failed: %s", e)
+
+
+# ---------------- Bot credentials (support both naming styles) ----------------
+MICROSOFT_APP_ID = _env_first("MICROSOFT_APP_ID", "MicrosoftAppId")
+MICROSOFT_APP_PASSWORD = _env_first("MICROSOFT_APP_PASSWORD", "MicrosoftAppPassword")
+MICROSOFT_APP_TENANT_ID = _env_first("MicrosoftAppTenantId", "MICROSOFT_APP_TENANT_ID")
+MICROSOFT_APP_TYPE = (_env_first("MicrosoftAppType", "MICROSOFT_APP_TYPE") or "MultiTenant").strip()
+
+APP_ID = MICROSOFT_APP_ID or ""
+APP_PASSWORD = MICROSOFT_APP_PASSWORD or ""
 
 logger.info(
-    "BOOT_AUTH appType=%s appIdTail=%s tenantIdTail=%s appSecretLen=%s "
-    "envUsed(appId=%s appPwd=%s tenant=%s type=%s)",
-    APP_TYPE,
-    _mask(APP_ID, keep=6),
-    _mask(APP_TENANT_ID, keep=6),
-    len(APP_PASSWORD) if APP_PASSWORD else 0,
-    "MICROSOFT_APP_ID/MicrosoftAppId",
-    "MICROSOFT_APP_PASSWORD/MicrosoftAppPassword",
-    "MicrosoftAppTenantId/MICROSOFT_APP_TENANT_ID",
-    "MicrosoftAppType/MICROSOFT_APP_TYPE",
+    "BOT_AUTH_CONFIG appId=%s tenantId=%s appType=%s appSecretPresent=%s",
+    _mask(APP_ID, 8),
+    _mask(MICROSOFT_APP_TENANT_ID, 8),
+    MICROSOFT_APP_TYPE,
+    bool(APP_PASSWORD),
 )
 
-if not APP_ID or not APP_PASSWORD:
-    logger.warning(
-        "BOOT_AUTH_MISSING appIdPresent=%s appPwdPresent=%s (this will cause auth failures)",
-        bool(APP_ID),
-        bool(APP_PASSWORD),
-    )
+# Force tenant-specific OAuth endpoint for SingleTenant to avoid "Bot Framework" tenant confusion.
+oauth_endpoint = None
+openid_metadata = None
+tenant = None
 
-# ---------------- Adapter setup ----------------
+if MICROSOFT_APP_TYPE.lower() == "singletenant" and MICROSOFT_APP_TENANT_ID:
+    tenant = MICROSOFT_APP_TENANT_ID.strip()
+    oauth_endpoint = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+    openid_metadata = f"https://login.microsoftonline.com/{tenant}/v2.0/.well-known/openid-configuration"
+    logger.info("BOT_AUTH_CONFIG using tenant oauth_endpoint=%s", oauth_endpoint)
+else:
+    logger.info("BOT_AUTH_CONFIG using SDK default oauth endpoint (not forcing tenant)")
+
+# Try to set global OAuth endpoint in connector credentials (varies by SDK version).
+try:
+    from botframework.connector.auth import AppCredentials, MicrosoftAppCredentials  # type: ignore
+
+    if oauth_endpoint and hasattr(AppCredentials, "oauth_endpoint"):
+        AppCredentials.oauth_endpoint = oauth_endpoint
+    if oauth_endpoint and hasattr(MicrosoftAppCredentials, "oauth_endpoint"):
+        MicrosoftAppCredentials.oauth_endpoint = oauth_endpoint
+
+    # Some versions support tenant on credentials:
+    if tenant and hasattr(MicrosoftAppCredentials, "tenant_id"):
+        MicrosoftAppCredentials.tenant_id = tenant  # type: ignore
+
+except Exception as e:
+    logger.warning("BOT_AUTH_CONFIG could not set global credential oauth endpoint: %s", e)
+
+
+# ---------------- Adapter ----------------
 adapter_settings = BotFrameworkAdapterSettings(APP_ID, APP_PASSWORD)
 
-# Force SingleTenant tenant binding when supported by the installed SDK
-if APP_TYPE.lower() == "singletentant" or APP_TYPE.lower() == "singletenant":
-    if APP_TENANT_ID:
-        if hasattr(adapter_settings, "channel_auth_tenant"):
-            adapter_settings.channel_auth_tenant = APP_TENANT_ID
-            logger.info("BOOT_AUTH adapter_settings.channel_auth_tenant set to tenantIdTail=%s", _mask(APP_TENANT_ID, 6))
-        elif hasattr(adapter_settings, "tenant_id"):
-            adapter_settings.tenant_id = APP_TENANT_ID
-            logger.info("BOOT_AUTH adapter_settings.tenant_id set to tenantIdTail=%s", _mask(APP_TENANT_ID, 6))
-        else:
-            logger.warning(
-                "BOOT_AUTH could not set tenant on adapter_settings (SDK too old?). "
-                "SingleTenant bots may fail unless the SDK supports channel_auth_tenant."
-            )
-    else:
-        logger.warning("BOOT_AUTH SingleTenant selected but no tenant id found in env vars.")
+# Also set endpoints on adapter settings if supported by this SDK version.
+if oauth_endpoint:
+    for attr, val in [("oauth_endpoint", oauth_endpoint), ("open_id_metadata", openid_metadata)]:
+        try:
+            if hasattr(adapter_settings, attr):
+                setattr(adapter_settings, attr, val)
+        except Exception:
+            pass
+    try:
+        if tenant and hasattr(adapter_settings, "channel_auth_tenant"):
+            setattr(adapter_settings, "channel_auth_tenant", tenant)
+    except Exception:
+        pass
 
 adapter = BotFrameworkAdapter(adapter_settings)
 
 
-def _log_bot_token_claims(tag: str, service_url: Optional[str] = None) -> None:
-    """
-    Try to acquire the same token the SDK uses and log key claims.
-    If this fails or claims are wrong, it explains the Unauthorized.
-    """
-    try:
-        creds = MicrosoftAppCredentials(APP_ID, APP_PASSWORD)
-        if service_url:
-            # Not required for outbound, but harmless and useful
-            MicrosoftAppCredentials.trust_service_url(service_url)
-
-        tok = creds.get_access_token()
-        claims = decode_jwt_noverify(tok)
-        logger.error(
-            "BF_TOKEN %s tokenPrefix=%s tid=%s aud=%s appid=%s azp=%s iss=%s exp=%s",
-            tag,
-            tok[:20] + "...",
-            claims.get("tid"),
-            claims.get("aud"),
-            claims.get("appid") or claims.get("azp") or claims.get("appId"),
-            claims.get("azp"),
-            claims.get("iss"),
-            claims.get("exp"),
-        )
-    except Exception as e:
-        logger.error("BF_TOKEN %s failed_to_get_token: %s: %s", tag, type(e).__name__, e)
+# ---------------- Bot logic ----------------
+class DiagEchoBot(ActivityHandler):
+    async def on_message_activity(self, turn_context: TurnContext):
+        text = (turn_context.activity.text or "").strip()
+        logger.info("BOT_MSG_IN text=%s", _mask(text, 30))
+        # This is the moment that currently fails for you (401 Unauthorized).
+        await safe_send_text(turn_context, f"Echo: {text or '(empty)'}")
 
 
+bot = DiagEchoBot()
+
+
+# ---------------- Safer send wrapper (adds token diagnostics on failure) ----------------
 async def safe_send_text(turn_context: TurnContext, text: str) -> None:
-    """
-    Send a message with deep diagnostics on Unauthorized.
-    """
-    svc = getattr(turn_context.activity, "service_url", None)
-    ch = getattr(turn_context.activity, "channel_id", None)
-    conv = getattr(getattr(turn_context.activity, "conversation", None), "id", None)
     try:
-        # Trust service URL for completeness
-        if svc:
-            MicrosoftAppCredentials.trust_service_url(svc)
-
         await turn_context.send_activity(text)
-    except Exception as e:
-        # Log token claims right when it fails
-        _log_bot_token_claims("on_send_fail", service_url=svc)
-
-        # Try to extract HTTP response info if present
-        resp = getattr(e, "response", None)
-        status = getattr(resp, "status", None) or getattr(resp, "status_code", None)
-        reason = getattr(resp, "reason", None)
-        headers = getattr(resp, "headers", None) or {}
-        www_auth = None
-        try:
-            if headers:
-                www_auth = headers.get("WWW-Authenticate") or headers.get("www-authenticate")
-        except Exception:
-            pass
-
-        body = await _read_response_text(resp)
-
+        logger.info("SEND_OK channel=%s serviceUrl=%s", turn_context.activity.channel_id, turn_context.activity.service_url)
+    except ErrorResponseException as e:
+        # Pull adapter token claims so we can see if aud/tid look correct for api.botframework.com
+        await _log_adapter_token_claims(turn_context.adapter)
         logger.error(
-            "SEND_FAIL %s: status=%s reason=%s www_auth=%s channel=%s serviceUrl=%s convId=%s body=%s",
-            type(e).__name__,
-            status,
-            reason,
-            www_auth,
-            ch,
-            svc,
-            conv,
-            (body[:800] + "...") if body and len(body) > 800 else body,
+            "SEND_FAIL ErrorResponseException: msg=%s channel=%s serviceUrl=%s convId=%s",
+            str(e),
+            turn_context.activity.channel_id,
+            turn_context.activity.service_url,
+            getattr(turn_context.activity.conversation, "id", None),
         )
+        raise
+    except Exception as e:
+        await _log_adapter_token_claims(turn_context.adapter)
+        logger.error("SEND_FAIL_UNK %s", e)
         raise
 
 
-# ---------------- Azure AI Language calls (simple example) ----------------
-async def call_clu(text: str) -> Tuple[str, float, Dict[str, Any]]:
-    """
-    Returns (intent, score, raw_json). If not configured, returns fallback.
-    """
-    if not (LANGUAGE_ENDPOINT and LANGUAGE_KEY and CLU_PROJECT_NAME and CLU_DEPLOYMENT_NAME):
-        return ("SmallTalk", 0.0, {"_note": "CLU not configured; fallback intent"})
-    url = f"{LANGUAGE_ENDPOINT}/language/:analyze-conversations?api-version=2022-10-01-preview"
-    payload = {
-        "kind": "Conversation",
-        "analysisInput": {
-            "conversationItem": {
-                "id": "1",
-                "participantId": "user",
-                "text": text,
-            }
-        },
-        "parameters": {
-            "projectName": CLU_PROJECT_NAME,
-            "deploymentName": CLU_DEPLOYMENT_NAME,
-            "stringIndexType": "Utf16CodeUnit",
-        },
-    }
-    headers = {"Ocp-Apim-Subscription-Key": LANGUAGE_KEY, "Content-Type": "application/json"}
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, headers=headers, json=payload) as r:
-            j = await r.json()
-    top = j.get("result", {}).get("prediction", {}).get("topIntent", "")
-    intents = j.get("result", {}).get("prediction", {}).get("intents", [])
-    score = 0.0
-    for it in intents:
-        if it.get("category") == top:
-            score = float(it.get("confidenceScore", 0.0))
-            break
-    return (top or "None", score, j)
-
-
-async def call_qa(text: str) -> Tuple[str, float, Dict[str, Any]]:
-    """
-    Returns (answer, score, raw_json). If not configured, returns fallback.
-    """
-    if not (LANGUAGE_ENDPOINT and LANGUAGE_KEY and QA_PROJECT_NAME and QA_DEPLOYMENT_NAME):
-        return ("(QA not configured)", 0.0, {"_note": "QA not configured"})
-    url = f"{LANGUAGE_ENDPOINT}/language/:query-knowledgebases?api-version=2021-10-01"
-    payload = {
-        "question": text,
-        "projectName": QA_PROJECT_NAME,
-        "deploymentName": QA_DEPLOYMENT_NAME,
-        "top": 1,
-    }
-    headers = {"Ocp-Apim-Subscription-Key": LANGUAGE_KEY, "Content-Type": "application/json"}
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, headers=headers, json=payload) as r:
-            j = await r.json()
-    answers = j.get("answers", [])
-    if not answers:
-        return ("(no answer)", 0.0, j)
-    best = answers[0]
-    return (best.get("answer", "(empty)"), float(best.get("confidenceScore", 0.0)), j)
-
-
-# ---------------- Bot logic ----------------
-class SurecoverBot(ActivityHandler):
-    async def on_message_activity(self, turn_context: TurnContext):
-        user_text = (turn_context.activity.text or "").strip()
-        if not user_text:
-            await safe_send_text(turn_context, "I didn't receive any text.")
-            return
-
-        intent, score, _ = await call_clu(user_text)
-        logger.info("CLU intent=%s score=%.3f", intent, score)
-
-        # Example routing
-        if intent.lower() == "smalltalk":
-            await safe_send_text(turn_context, "Hi! (SmallTalk) — try asking me a question.")
-            return
-
-        ans, qa_score, _ = await call_qa(user_text)
-        logger.info("QA score=%.3f", qa_score)
-        await safe_send_text(turn_context, ans)
-
-
-bot = SurecoverBot()
-
-
-# ---------------- Error handler ----------------
+@adapter.on_turn_error
 async def on_error(context: TurnContext, error: Exception):
-    logger.exception("[on_turn_error] %s", error)
-    # Try to send a user-friendly error, but don’t create a second exception storm
+    logger.error("[on_turn_error] %s", error)
+    # If auth is broken, even this will fail — so we swallow.
     try:
-        await safe_send_text(context, "Sorry, the bot hit an error.")
+        await safe_send_text(context, "Sorry — the bot hit an error.")
     except Exception as e:
         logger.error("on_error: failed to send error message (likely auth issue): %s", e)
 
 
-adapter.on_turn_error = on_error
-
-
-# ---------------- FastAPI app ----------------
-app = FastAPI()
-
-
-@app.get("/health")
-async def health():
-    return {
-        "status": "ok",
-        "time": int(time.time()),
-        "appType": APP_TYPE,
-        "appIdTail": _mask(APP_ID, 6),
-        "tenantIdTail": _mask(APP_TENANT_ID, 6),
-    }
+# ---------------- Routes ----------------
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True}
 
 
 @app.get("/debug/token")
 async def debug_token():
     """
-    Returns token claims (no signature verification) for the token the SDK acquires.
-    Do NOT expose this publicly in production.
+    Returns *claims only* for the outbound connector token (no secrets, no raw token).
+    This helps confirm audience/tenant quickly.
     """
     try:
-        creds = MicrosoftAppCredentials(APP_ID, APP_PASSWORD)
-        tok = creds.get_access_token()
-        claims = decode_jwt_noverify(tok)
-        # return only safe-ish subset
+        # Try to access adapter credentials token (best-effort)
+        await _log_adapter_token_claims(adapter)
+        # Also return config summary
         return {
-            "tokenPrefix": tok[:20] + "...",
-            "tid": claims.get("tid"),
-            "aud": claims.get("aud"),
-            "appid": claims.get("appid") or claims.get("azp"),
-            "iss": claims.get("iss"),
-            "exp": claims.get("exp"),
+            "appIdMasked": _mask(APP_ID, 8),
+            "tenantIdMasked": _mask(MICROSOFT_APP_TENANT_ID, 8),
+            "appType": MICROSOFT_APP_TYPE,
+            "forcedOauthEndpoint": oauth_endpoint or "(sdk-default)",
+            "note": "Check Log Stream for ADAPTER_TOKEN_CLAIMS line.",
         }
     except Exception as e:
-        return {"error": f"{type(e).__name__}: {e}"}
+        return {"error": str(e)}
 
 
 @app.post("/api/messages")
-async def messages(req: Request):
-    body = await req.json()
-    activity = Activity().deserialize(body)
+async def messages(req: Request) -> Response:
     auth_header = req.headers.get("Authorization", "")
 
-    # Incoming HTTP diagnostics (don’t log full bearer token)
-    auth_present = bool(auth_header)
-    auth_prefix = auth_header[:30] + "..." if auth_present else ""
-    logger.info("HTTP_IN /api/messages authHeaderPresent=%s authHeaderPrefix=%s", auth_present, auth_prefix)
+    logger.info(
+        "HTTP_IN /api/messages authHeaderPresent=%s authHeaderPrefix=%s",
+        bool(auth_header),
+        (auth_header[:30] + "…") if auth_header else "(none)",
+    )
 
-    # Activity diagnostics
+    # Decode inbound JWT claims (no signature verify) to confirm audience/issuer/tenant
     try:
-        conv_id = getattr(getattr(activity, "conversation", None), "id", None)
-        from_id = getattr(getattr(activity, "from_property", None), "id", None)
-        recip_id = getattr(getattr(activity, "recipient", None), "id", None)
-        service_url = getattr(activity, "service_url", None)
-        channel_id = getattr(activity, "channel_id", None)
-        logger.info(
-            "ACTIVITY_IN type=%s channel=%s serviceUrl=%s convId=%s from=%s recipient=%s authHint=%s",
-            getattr(activity, "type", None),
-            channel_id,
-            service_url,
-            conv_id,
-            from_id,
-            recip_id,
-            "hasChannelData" if getattr(activity, "channel_data", None) else "noChannelData",
-        )
-        if service_url:
-            logger.info("BOT_AUTH trusted serviceUrl=%s", service_url)
-            MicrosoftAppCredentials.trust_service_url(service_url)
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header.split(" ", 1)[1]
+            claims = _decode_jwt_noverify(token)
+            logger.info("AUTH_IN_CLAIMS %s", json.dumps(_safe_claims(claims), ensure_ascii=False))
     except Exception:
-        logger.exception("ACTIVITY_IN logging failed")
+        pass
 
+    body = await req.json()
+    activity = Activity().deserialize(body)
+
+    # Important: pass the incoming auth header through to adapter
     invoke_response = await adapter.process_activity(activity, auth_header, bot.on_turn)
 
     if invoke_response:
         return Response(
-            content=invoke_response.body,
+            content=json.dumps(invoke_response.body),
             status_code=invoke_response.status,
             media_type="application/json",
         )
-
-    return Response(status_code=201)
+    return Response(status_code=200)
