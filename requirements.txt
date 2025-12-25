@@ -5,3 +5,4 @@ botbuilder-core
 botbuilder-schema
 botframework-connector
 aiohttp
+python-dotenv
