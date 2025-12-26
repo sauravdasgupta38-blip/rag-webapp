@@ -211,7 +211,7 @@ async def call_clu(user_text: str) -> Tuple[Optional[str], float, List[Dict[str,
                 "id": "1",
                 "participantId": "user",
                 "modality": "text",
-                "language": "en",
+                "language": "en-gb",
                 "text": user_text,
             }
         },
